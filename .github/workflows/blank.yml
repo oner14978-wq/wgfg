@@ -1,0 +1,247 @@
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    steps:
+      # 1. REPOSITORIO
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2. INFORMACOES DO SISTEMA
+      - name: Show Windows and Hardware Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, BuildNumber, OSArchitecture
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object Manufacturer, Model,
+              @{Name="RAM_GB";Expression={[math]::Round($_.TotalPhysicalMemory / 1GB, 2)}}
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+      # 3. ATIVAR RDP
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+          Write-Host "RDP configurado."
+      # 4. CRIAR CONTA RDP
+      - name: Create RDP User
+        shell: powershell
+        env:
+          RDP_USERNAME: "Rafael"
+          RDP_PASSWORD: "P@ssw0rd!"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $username = $env:RDP_USERNAME
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          if ($null -eq $user) {
+            New-LocalUser -Name $username -Password $securePassword `
+              -FullName $username -Description "Conta RDP" `
+              -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name $username -Password $securePassword
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Write-Host "Usuario RDP configurado: $username"
+      # 5. VERIFICAR REDE
+      - name: Check Network Connectivity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          foreach ($h in @("pkgs.tailscale.com", "controlplane.tailscale.com")) {
+            Write-Host "Testando $h"
+            Test-NetConnection -ComputerName $h -Port 443 -WarningAction SilentlyContinue |
+              Select-Object ComputerName, RemotePort, TcpTestSucceeded
+          }
+      # 6. INSTALAR TAILSCALE (ARM64 via MSI, com fallback para EXE)
+      - name: Install Tailscale ARM64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+          $msiPath = Join-Path $env:TEMP "tailscale-arm64.msi"
+          $exePath = Join-Path $env:TEMP "tailscale-setup.exe"
+          $installed = $false
+          try {
+            Write-Host "Baixando Tailscale ARM64 (MSI)..."
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi" `
+              -OutFile $msiPath -UseBasicParsing
+            if ((Get-Item $msiPath).Length -lt 1MB) { throw "MSI invalido." }
+            $p = Start-Process msiexec.exe `
+              -ArgumentList "/i `"$msiPath`" /quiet /norestart" -Wait -PassThru
+            if ($p.ExitCode -in 0, 3010) { $installed = $true }
+            else { Write-Host "MSI retornou $($p.ExitCode)." }
+          } catch {
+            Write-Host "Falha no MSI: $($_.Exception.Message)"
+          }
+          if (-not $installed) {
+            Write-Host "Tentando instalador EXE..."
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+              -OutFile $exePath -UseBasicParsing
+            if ((Get-Item $exePath).Length -lt 1MB) { throw "EXE invalido." }
+            $p = Start-Process $exePath -ArgumentList "/quiet" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "Falha na instalacao do Tailscale: $($p.ExitCode)" }
+          }
+          $tsExe = @(
+            "$env:ProgramFiles\Tailscale\tailscale.exe",
+            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (!$tsExe) {
+            $found = Get-ChildItem -Path $env:ProgramFiles -Filter "tailscale.exe" `
+              -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $tsExe = $found.FullName }
+          }
+          if (!$tsExe) { throw "tailscale.exe nao foi encontrado apos a instalacao." }
+          "TAILSCALE_EXE=$tsExe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale instalado."
+          & $tsExe version
+      # 7. CONECTAR TAILSCALE
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Configure TAILSCALE_AUTH_KEY nos secrets do repositorio."
+          }
+          $tsExe = $env:TAILSCALE_EXE
+          if (!$tsExe -or !(Test-Path $tsExe)) { throw "Executavel do Tailscale nao encontrado." }
+          $hostname = "rafael-rdp-${{ github.run_id }}"
+          $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+          if ($service) {
+            Set-Service -Name "Tailscale" -StartupType Automatic
+            if ($service.Status -ne "Running") {
+              Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+            }
+            for ($i = 1; $i -le 12; $i++) {
+              Start-Sleep -Seconds 5
+              $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+              if ($service -and $service.Status -eq "Running") {
+                Write-Host "Servico Tailscale em execucao."
+                break
+              }
+              Write-Host "Aguardando servico Tailscale ($i/12)..."
+            }
+          } else {
+            Write-Host "Servico ainda nao apareceu; aguardando."
+            Start-Sleep -Seconds 15
+          }
+          Write-Host "Solicitando conexao Tailscale..."
+          $ErrorActionPreference = "Continue"
+          & $tsExe up "--auth-key=$env:TAILSCALE_AUTH_KEY" "--hostname=$hostname" "--accept-dns=false" "--unattended"
+          $upExitCode = $LASTEXITCODE
+          $ErrorActionPreference = "Stop"
+          if ($upExitCode -ne 0) {
+            Write-Host "tailscale up retornou $upExitCode. Verificando estado..."
+          }
+          $ip = $null
+          for ($i = 1; $i -le 24; $i++) {
+            Start-Sleep -Seconds 5
+            $ErrorActionPreference = "Continue"
+            $ipOutput = & $tsExe ip -4 2>$null
+            $ipExitCode = $LASTEXITCODE
+            $ErrorActionPreference = "Stop"
+            if ($ipExitCode -eq 0 -and $ipOutput) {
+              $candidate = ($ipOutput | Select-Object -First 1).ToString().Trim()
+              if ($candidate -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                $ip = $candidate
+                break
+              }
+            }
+            Write-Host "Tailscale ainda sem IP ($i/24). Aguardando..."
+          }
+          if (!$ip) {
+            $ErrorActionPreference = "Continue"
+            & $tsExe status
+            throw "Tailscale nao ficou conectado. Verifique a chave e o servico."
+          }
+          "TAILSCALE_IPV4=$ip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TAILSCALE_HOSTNAME=$hostname" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale conectado."
+          Write-Host "Hostname: $hostname"
+          Write-Host "IP: $ip"
+      # 8. CHROME
+      - name: Install Google Chrome
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+            winget install --id Google.Chrome --exact --silent `
+              --accept-package-agreements --accept-source-agreements
+          } else {
+            Write-Host "winget nao esta disponivel."
+          }
+      # 9. 7-ZIP
+      - name: Install 7-Zip
+        continue-on-error: true
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+            winget install --id 7zip.7zip --exact --silent `
+              --accept-package-agreements --accept-source-agreements
+          } else {
+            Write-Host "winget nao esta disponivel."
+          }
+      # 10. VERIFICAR RDP E TAILSCALE
+      - name: Verify RDP and Tailscale
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Get-Service -Name TermService | Select-Object Name, Status, StartType
+          $rdp = Test-NetConnection -ComputerName "127.0.0.1" -Port 3389 -WarningAction SilentlyContinue
+          Write-Host "Porta 3389 acessivel localmente: $($rdp.TcpTestSucceeded)"
+          if ($env:TAILSCALE_EXE -and (Test-Path $env:TAILSCALE_EXE)) {
+            & $env:TAILSCALE_EXE status
+            & $env:TAILSCALE_EXE ip -4
+          } else {
+            Write-Host "Executavel Tailscale indisponivel."
+          }
+      # 11. RELATORIO FINAL
+      - name: Final RDP Report
+        if: always()
+        shell: powershell
+        env:
+          RDP_USERNAME: "Rafael"
+          RDP_PASSWORD: "P@ssw0rd!"
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "          RELATORIO RDP"
+          Write-Host "======================================"
+          Write-Host "Usuario: $env:RDP_USERNAME"
+          Write-Host "Senha: $env:RDP_PASSWORD"
+          Write-Host "Hostname Tailscale: $env:TAILSCALE_HOSTNAME"
+          Write-Host "IP Tailscale: $env:TAILSCALE_IPV4"
+          Write-Host "Status do job: ${{ job.status }}"
+          Write-Host "======================================"
+      # 12. MANTER A MAQUINA LIGADA (sem isso o PC some ao fim do workflow)
+      - name: Keep Alive
+        shell: powershell
+        run: |
+          $end = (Get-Date).AddMinutes(340)
+          Write-Host "PC ligado ate: $end"
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+          }
